@@ -976,6 +976,18 @@ export function createApp({dbPath = ':memory:', corsOrigin = process.env.NOVA_CO
       const {admin} = adminAuth(req);
       return adminOps.listUsers(req.query || {});
     },
+    'POST /api/admin/ai-users'(req, b) {
+      const {admin} = adminAuth(req);
+      return adminOps.createAiUsers(admin, b || {}, ip(req));
+    },
+    'POST /api/admin/ai-users/rename'(req, b) {
+      const {admin} = adminAuth(req);
+      return adminOps.renameAiUsers(admin, b || {}, ip(req));
+    },
+    'POST /api/admin/users/:id/kind'(req, b) {
+      const {admin} = adminAuth(req);
+      return adminOps.setKind(admin, req.params.id, b || {}, ip(req));
+    },
     'GET /api/admin/users/:id'(req) {
       const {admin} = adminAuth(req);
       audit(admin.id, 'admin.user.read', 'user:' + req.params.id, ip(req), {adminUsername: admin.username});
@@ -1594,7 +1606,15 @@ export function createApp({dbPath = ':memory:', corsOrigin = process.env.NOVA_CO
           try { b = JSON.parse(raw.toString('utf8')); } catch { throw bad('BAD_JSON', '请求格式不正确'); }
           if (b === null || typeof b !== 'object') throw bad('BAD_JSON', '请求格式不正确');
         }
-        send(200, {ok: true, ...fn(req, b)});
+        const result = fn(req, b);
+        if (result && typeof result.then === 'function') {
+          result.then(v => send(200, {ok: true, ...(v || {})})).catch(e => {
+            if (e instanceof HttpError || e instanceof VipError || e instanceof ApiError) send(e.s, {error: {code: e.code, message: e.message, ...(e.extra || {})}});
+            else { slog('error', 'internal_error', {error: e.message, path}); try { alerts.crash(e, {path}); } catch {} send(500, {error: {code: 'INTERNAL', message: '服务器开小差了'}}); }
+          });
+          return;
+        }
+        send(200, {ok: true, ...result});
       } catch (e) {
         if (e instanceof HttpError || e instanceof VipError || e instanceof ApiError) send(e.s, {error: {code: e.code, message: e.message, ...(e.extra || {})}});
         else { slog('error', 'internal_error', {error: e.message, path}); try { alerts.crash(e, {path}); } catch {} send(500, {error: {code: 'INTERNAL', message: '服务器开小差了'}}); }

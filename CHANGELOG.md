@@ -1,5 +1,14 @@
 # 更新日志（最新在上）
 
+## 2.1.0 · 管理端用户列表不再被 AI 账号挤掉（2026-11-21）
+
+热更新版本号 `2.1.0`。
+
+- **用户列表不再封顶 100。** `GET /api/admin/users` 在不传 `limit`、传 `0`/`all`，或仍传旧的 `limit>=100` 时返回全部匹配用户，不再把真人截掉。需要小页时才使用小于 100 的 `limit`（仍按 id 游标）。
+- **真人优先。** 完整列表里真人排在 AI 前面，避免新批量机器人占满第一屏。
+- **分类。** 用户带 `kind` / `accountKind` / `isAi`（`human` 或 `ai`）。可用 `?kind=human` 或 `?kind=ai`。响应另有 `humans`、`aiUsers` 和 `counts`。`POST /api/admin/users/:id/kind` 可改分类。统计里的 `users.human` / `users.ai` 分开计数。
+- **网名。** `POST /api/admin/ai-users` 创建内部 AI 账号，显示名按中文网名生成（配置 `NOVA_NICK_API_KEY` 时走模型，否则用本地网名，不再用编号名）。`POST /api/admin/ai-users/rename` 给已有 AI 账号换网名，默认只改显得很假的名字。
+
 ## V7 0.7.0-m6.1 · 安全核心、合规上线、星澜主题与生产运维（2026-11-12）
 
 本版号保持 `0.7.0-m6.1`（已含获准的 M7.2 视觉）。当前生产入口 `http://47.239.0.90`（HTTP，暂无域名）。

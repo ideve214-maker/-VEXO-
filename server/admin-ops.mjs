@@ -2,6 +2,7 @@
 import {randomBytes} from 'node:crypto';
 import {ApiError} from './errors.mjs';
 import {hashPassword} from './auth.mjs';
+import {generateNicknames, looksLow} from './nicknames.mjs';
 
 function asInt(v) {
   const n = Number(v);
@@ -17,6 +18,7 @@ export function createAdminOps(db, {now, vip, profile, pay, audit} = {}) {
     const st = vip ? vip.status(u) : {active: !!(u.vip_until && u.vip_until > nowFn()), until: u.vip_until};
     const posts = db.prepare('SELECT COUNT(*) n FROM posts WHERE author_id=? AND deleted_at IS NULL').get(u.id).n;
     const name = (p && p.displayName) || u.username;
+    const kind = u.account_kind === 'ai' ? 'ai' : 'human';
     return {
       id: u.id,
       userId: u.id,
@@ -37,6 +39,10 @@ export function createAdminOps(db, {now, vip, profile, pay, audit} = {}) {
       lastLoginAt: u.last_login_at || null,
       lastLogin: u.last_login_at || null,
       role: u.role,
+      kind,
+      accountKind: kind,
+      isAi: kind === 'ai',
+      lowName: kind === 'ai' && looksLow(name),
       mustChangePw: !!u.must_change_pw,
       avatar: p && p.avatar ? p.avatar : '',
       bio: (p && p.bio) || '',
@@ -53,10 +59,16 @@ export function createAdminOps(db, {now, vip, profile, pay, audit} = {}) {
   }
 
   function listUsers(q = {}) {
-    const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 100);
-    const cursor = q.cursor != null && q.cursor !== '' ? asInt(q.cursor) : null;
+    const rawLimit = q.limit;
+    const numeric = Number(rawLimit);
+    // 旧客户端把上限写成 100，服务端再卡一次，AI 账号一多就把更早的真人挤出列表。
+    // 不传、0、all，或仍传 >=100，都视为要完整列表。更小的 limit 仍按 id 游标分页。
+    const unbounded = rawLimit == null || rawLimit === '' || String(rawLimit).toLowerCase() === 'all' || numeric === 0 || numeric >= 100;
+    const limit = unbounded ? null : Math.max(1, Math.floor(numeric) || 1);
+    const cursor = !unbounded && q.cursor != null && q.cursor !== '' ? asInt(q.cursor) : null;
     const status = String(q.status || '').trim();
     const search = String(q.q || q.query || q.search || '').trim();
+    const kindQ = String(q.kind || q.accountKind || 'all').trim().toLowerCase();
     const where = [], args = [];
     if (status === 'banned' || status === 'active') { where.push('u.status=?'); args.push(status); }
     else if (status === 'vip') { where.push('u.vip_until IS NOT NULL AND u.vip_until>?'); args.push(nowFn()); }
@@ -65,13 +77,43 @@ export function createAdminOps(db, {now, vip, profile, pay, audit} = {}) {
       const like = '%' + search.replace(/%/g, '') + '%';
       args.push(like, like, like);
     }
+    const countWhere = where.slice();
+    const countArgs = args.slice();
+    if (kindQ === 'human' || kindQ === 'real' || kindQ === 'user') where.push("IFNULL(u.account_kind,'human')='human'");
+    else if (kindQ === 'ai' || kindQ === 'bot') where.push("u.account_kind='ai'");
+    else if (kindQ && kindQ !== 'all') throw new ApiError(400, 'BAD_KIND', 'kind 只能是 all、human 或 ai');
     if (cursor != null && Number.isFinite(cursor)) { where.push('u.id<?'); args.push(cursor); }
+    const order = unbounded
+      ? "ORDER BY CASE WHEN IFNULL(u.account_kind,'human')='ai' THEN 1 ELSE 0 END, u.id DESC"
+      : 'ORDER BY u.id DESC';
     const sql = `SELECT u.* FROM users u LEFT JOIN profiles p ON p.user_id=u.id
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY u.id DESC LIMIT ?`;
-    const rows = db.prepare(sql).all(...args, limit + 1);
-    const more = rows.length > limit;
+      ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ${order}` + (limit ? ' LIMIT ?' : '');
+    const rows = limit ? db.prepare(sql).all(...args, limit + 1) : db.prepare(sql).all(...args);
+    const more = limit ? rows.length > limit : false;
     const slice = more ? rows.slice(0, limit) : rows;
-    return {users: slice.map(userRow), members: slice.map(userRow), nextCursor: more ? slice[slice.length - 1].id : null};
+    const users = slice.map(userRow);
+    const grouped = {
+      human: users.filter(u => u.kind === 'human'),
+      ai: users.filter(u => u.kind === 'ai'),
+    };
+    const countSql = `SELECT IFNULL(u.account_kind,'human') k, COUNT(*) n FROM users u LEFT JOIN profiles p ON p.user_id=u.id
+      ${countWhere.length ? 'WHERE ' + countWhere.join(' AND ') : ''} GROUP BY k`;
+    const counts = {human: 0, ai: 0, total: 0, shown: users.length};
+    for (const row of db.prepare(countSql).all(...countArgs)) {
+      if (row.k === 'ai') counts.ai = row.n;
+      else counts.human += row.n;
+    }
+    counts.total = counts.human + counts.ai;
+    return {
+      users,
+      members: users,
+      humans: grouped.human,
+      aiUsers: grouped.ai,
+      counts,
+      limit: limit,
+      truncated: more,
+      nextCursor: more ? slice[slice.length - 1].id : null,
+    };
   }
 
   function oneUser(id) {
@@ -309,6 +351,8 @@ export function createAdminOps(db, {now, vip, profile, pay, audit} = {}) {
     const users = db.prepare('SELECT COUNT(*) n FROM users').get().n;
     const banned = db.prepare("SELECT COUNT(*) n FROM users WHERE status='banned'").get().n;
     const vipN = db.prepare('SELECT COUNT(*) n FROM users WHERE vip_until IS NOT NULL AND vip_until>?').get(nowFn()).n;
+    const humanN = db.prepare("SELECT COUNT(*) n FROM users WHERE IFNULL(account_kind,'human')<>'ai'").get().n;
+    const aiN = db.prepare("SELECT COUNT(*) n FROM users WHERE account_kind='ai'").get().n;
     const postsVis = db.prepare('SELECT COUNT(*) n FROM posts WHERE deleted_at IS NULL').get().n;
     const postsHid = db.prepare('SELECT COUNT(*) n FROM posts WHERE deleted_at IS NOT NULL').get().n;
     const commentsVis = db.prepare('SELECT COUNT(*) n FROM post_comments WHERE deleted_at IS NULL').get().n;
@@ -323,7 +367,7 @@ export function createAdminOps(db, {now, vip, profile, pay, audit} = {}) {
       payReview = db.prepare("SELECT COUNT(*) n FROM pay_orders WHERE status='awaiting_review'").get().n;
     }
     return {
-      users: {total: users, active: users - banned, banned, vip: vipN},
+      users: {total: users, active: users - banned, banned, vip: vipN, human: humanN, ai: aiN},
       posts: {visible: postsVis, removed: postsHid},
       comments: {visible: commentsVis},
       reports: {pending: reportsPending},
@@ -429,8 +473,93 @@ export function createAdminOps(db, {now, vip, profile, pay, audit} = {}) {
       })};
   }
 
+  function handleOf(display) {
+    const raw = String(display || '').replace(/[^\p{L}\p{N}_]/gu, '');
+    const base = raw.length >= 3 ? raw.slice(0, 20) : ('网友' + raw).slice(0, 20);
+    return base.length >= 3 ? base : '网友' + randomBytes(3).toString('hex');
+  }
+
+  function setKind(admin, id, body = {}, ip = null) {
+    const u = getUser(id);
+    const kind = String(body.kind || body.accountKind || '').trim().toLowerCase();
+    if (kind !== 'human' && kind !== 'ai') throw new ApiError(400, 'BAD_KIND', 'kind 只能是 human 或 ai');
+    db.prepare('UPDATE users SET account_kind=? WHERE id=?').run(kind, u.id);
+    if (audit) audit(admin.id, 'admin.user.kind', 'user:' + u.id, ip, {kind, username: u.username, adminUsername: admin.username});
+    return {user: userRow(getUser(u.id))};
+  }
+
+  async function createAiUsers(admin, body = {}, ip = null) {
+    const count = Math.min(200, Math.max(1, Math.floor(Number(body.count ?? body.n ?? 1)) || 1));
+    const names = Array.isArray(body.names) && body.names.length
+      ? body.names.map(x => String(x || '').trim()).filter(Boolean).slice(0, count)
+      : await generateNicknames(count);
+    while (names.length < count) names.push(...await generateNicknames(count - names.length));
+    const ins = db.prepare(`INSERT INTO users(username,email,password_hash,created_at,account_kind,status,role) VALUES(?,?,?,?, 'ai','active','user')`);
+    const takenU = db.prepare('SELECT 1 FROM users WHERE username=? COLLATE NOCASE');
+    const takenE = db.prepare('SELECT 1 FROM users WHERE email=?');
+    const created = [];
+    for (let i = 0; i < count; i++) {
+      const display = String(names[i] || '晚风收信').trim().slice(0, 12) || '晚风收信';
+      let username = handleOf(display);
+      let n = 0;
+      while (takenU.get(username)) {
+        n++;
+        const extra = ['呀', '呢', '哦', '呐', '咯'][n % 5];
+        username = (handleOf(display).slice(0, 18) + extra + (n > 5 ? String(n % 10) : '')).slice(0, 20);
+        if (n > 30) username = ('网友' + randomBytes(4).toString('hex')).slice(0, 20);
+      }
+      let email = 'ai.' + randomBytes(6).toString('hex') + '@members.nova.invalid';
+      while (takenE.get(email)) email = 'ai.' + randomBytes(6).toString('hex') + '@members.nova.invalid';
+      const pw = 'Ai' + randomBytes(9).toString('base64url') + '9z';
+      const r = ins.run(username, email, hashPassword(pw), nowFn());
+      const u = getUser(Number(r.lastInsertRowid));
+      if (profile && profile.save) profile.save(u, {displayName: display.slice(0, 20)});
+      created.push(userRow(getUser(u.id)));
+    }
+    if (audit) audit(admin.id, 'admin.ai_users.create', 'ai-users', ip, {count: created.length, adminUsername: admin.username});
+    return {users: created, count: created.length, source: process.env.NOVA_NICK_API_KEY ? 'model-or-local' : 'local'};
+  }
+
+  async function renameAiUsers(admin, body = {}, ip = null) {
+    let targets;
+    if (Array.isArray(body.ids) && body.ids.length) {
+      targets = body.ids.map(id => getUser(id)).filter(u => u.account_kind === 'ai');
+    } else {
+      const onlyLow = body.all !== true;
+      targets = db.prepare("SELECT * FROM users WHERE account_kind='ai' ORDER BY id").all()
+        .filter(u => !onlyLow || looksLow((profile && profile.publicOf(u).displayName) || u.username));
+    }
+    if (!targets.length) return {users: [], count: 0};
+    const cap = Math.min(targets.length, 200);
+    targets = targets.slice(0, cap);
+    const names = await generateNicknames(targets.length);
+    const takenU = db.prepare('SELECT id FROM users WHERE username=? COLLATE NOCASE');
+    const renamed = [];
+    for (let i = 0; i < targets.length; i++) {
+      const u = targets[i];
+      const display = String(names[i] || '晚风收信').trim().slice(0, 12) || '晚风收信';
+      if (profile && profile.save) profile.save(u, {displayName: display.slice(0, 20)});
+      if (body.renameUsername === true) {
+        let username = handleOf(display);
+        let n = 0;
+        while (true) {
+          const row = takenU.get(username);
+          if (!row || row.id === u.id) break;
+          n++;
+          username = (handleOf(display).slice(0, 18) + ['呀', '呢', '哦'][n % 3]).slice(0, 20);
+          if (n > 20) { username = u.username; break; }
+        }
+        if (username !== u.username) db.prepare('UPDATE users SET username=? WHERE id=?').run(username, u.id);
+      }
+      renamed.push(userRow(getUser(u.id)));
+    }
+    if (audit) audit(admin.id, 'admin.ai_users.rename', 'ai-users', ip, {count: renamed.length, adminUsername: admin.username});
+    return {users: renamed, count: renamed.length};
+  }
+
   return {
     listUsers, oneUser, ban, unban, resetPassword, grantVip, revokeVip,
+    setKind, createAiUsers, renameAiUsers,
     listContent, getContent, hideContent, restoreContent,
     stats, listAnnouncements, addAnnouncement, removeAnnouncement, editAnnouncement, withdrawAnnouncement,
     listCommunities, getCommunity, listChannelMessages, userRow,
